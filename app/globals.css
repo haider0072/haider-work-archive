@@ -67,6 +67,7 @@ main { min-height: 100vh; overflow: clip; }
 .tone-ink { background: #111318; color: #fff; }
 .tone-blue { background: var(--blue); color: #fff; }
 .tone-cream { background: #eeeae2; color: var(--ink); }
+.tone-night { background: #05060c; color: #fff; }
 .card-index { position: absolute; top: 14px; left: 14px; z-index: 3; font: 700 .62rem/1 var(--font-geist-mono), monospace; mix-blend-mode: difference; color: #fff; }
 .open-mark { position: absolute; top: 10px; right: 10px; z-index: 5; width: 33px; height: 33px; border-radius: 50%; display: grid; place-items: center; background: #fff; color: var(--ink); font-size: 1rem; opacity: 0; transform: translateY(5px); transition: .22s ease; }
 .project-card:hover .open-mark { opacity: 1; transform: translateY(0); }
@@ -168,8 +169,17 @@ footer { height:100px; padding:0 28px; display:grid; grid-template-columns:1fr a
 .modal-close { position:absolute; z-index:20; top:18px; right:18px; border:1px solid rgba(11,12,15,.12); border-radius:99px; background:rgba(255,255,255,.9); box-shadow:0 5px 18px rgba(0,0,0,.08); backdrop-filter:blur(12px); padding:10px 14px; font-size:.6rem; font-weight:800; cursor:pointer; }
 .modal-visual { position:absolute; inset:0; overflow:hidden; user-select:none; touch-action:none; }.modal-visual .visual{inset:0}.modal-visual.draggable{cursor:grab}.modal-visual.draggable:active{cursor:grabbing}.modal-visual.draggable .creature-scene,.modal-visual.draggable .material-shelf,.modal-visual.draggable .grass-scene{transform:perspective(1100px) rotateX(var(--rx)) rotateY(var(--ry)) scale(.9);box-shadow:0 30px 80px rgba(0,0,0,.25);transition:transform .08s linear}.modal-visual.model-playground{touch-action:auto;background:#e4ded2}
 .model-shell{position:absolute;inset:0;background:#e4ded2}
+/* Night scene (Old Man & the Monster): dark viewer chrome so the cinematic
+   render and the live WebGL sit on the same near-black backdrop. */
+.model-shell.theme-night{background:#05060c}
+.modal-visual.model-playground:has(.theme-night){background:#05060c}
+.model-shell.theme-night .model-poster-fallback,
+.model-shell.theme-night .render-view{background:#05060c}
+.model-shell.theme-night .three-canvas canvas{filter:none}
+.model-shell.theme-night .focus-depth{mask-image:radial-gradient(ellipse 62% 66% at 50% 48%,transparent 0 60%,rgba(0,0,0,.15) 74%,#000 100%);-webkit-mask-image:radial-gradient(ellipse 62% 66% at 50% 48%,transparent 0 60%,rgba(0,0,0,.15) 74%,#000 100%)}
+.model-shell.theme-night .model-loading{background:rgba(12,14,20,.8);color:#cfd6e6}
 .three-canvas{position:absolute;inset:0;z-index:2;overflow:hidden;touch-action:none;opacity:0;transition:opacity .35s ease}
-.three-canvas canvas{width:100%;height:100%;display:block;outline:0;filter:saturate(.96) contrast(.97) brightness(1.015)}
+.three-canvas canvas{width:100%;height:100%;display:block;outline:0;filter:saturate(1.08) contrast(1.02) brightness(1.01)}
 .model-shell.model-loaded .three-canvas{opacity:1}
 .model-poster-fallback,.render-view{width:100%;height:100%;display:block;object-fit:contain;background:#e8e2d7}
 .model-poster-fallback{position:absolute;inset:0;z-index:1;filter:blur(8px) saturate(.9);transform:scale(1.02);opacity:.62;transition:opacity .3s ease}
