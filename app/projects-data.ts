@@ -57,7 +57,8 @@ export type VolumetricConfig = {
   anisotropy: number; // Henyey-Greenstein g, forward-scatter for beams
   colorHex: number;
   steps: number; // raymarch steps (desktop); mobile uses a fraction
-  strength?: number; // overall in-scatter multiplier (visual gain)
+  strength?: number; // gain on beam (spot) in-scatter only
+  ambient?: number; // gain on the uniform haze floor, independent of `strength`
 };
 
 export type ViewerConfig = {
@@ -141,12 +142,14 @@ export const projects: Project[] = [
       // Cycles render (AgX desaturates the highlights too much for this bright,
       // colourful scene).
       toneMapping: "neutral",
-      exposureEV: -0.05,
-      backgroundHex: 0xe4ded2,
+      exposureEV: 0,
+      // Matched to the lit backdrop plane inside the GLB so the plane's far edge
+      // does not read as a hard diagonal seam against the surrounding colour.
+      backgroundHex: 0xfdf6e4,
       environmentHdr: "/projects/tree-puddle/lakeside-sunrise-2k.hdr?v=4",
       environmentRotationDeg: [0, -30, -148],
       environmentAsBackground: false,
-      environmentIntensity: 0.85,
+      environmentIntensity: 1.15,
       camera: {
         type: "orthographic",
         position: [5.678516, 2.73531, 4.135495],
@@ -154,12 +157,26 @@ export const projects: Project[] = [
         // Blender frames this with ortho_scale 3.5 + a large lens shift for a
         // static composition. In an orbit viewer the target recentres the
         // shot, so we widen the frustum a touch and drop the shift instead of
-        // double-counting it (which pushed the tree into a corner).
-        orthoScale: 6.2,
+        // double-counting it (which pushed the tree into a corner). Kept just
+        // tight enough that the backdrop plane still fills the frame.
+        orthoScale: 5.5,
         shiftX: 0,
         shiftY: 0,
       },
-      lights: [],
+      lights: [
+        {
+          // The HDRI alone cannot cast anything: image-based lighting carries no
+          // shadow in three.js, which is why the diorama floated with no contact
+          // shadow at all. This directional key stands in for the HDRI's sun,
+          // aimed so the shadow falls to frame-left as it does in the render.
+          kind: "directional",
+          position: [-0.66, 7.45, 11.14],
+          target: [0, 0, 0.7],
+          colorHex: 0xfff0dd,
+          intensity: 5.2,
+          castShadow: true,
+        },
+      ],
       bloom: { strength: 0.12, radius: 0.5, threshold: 0.9 },
       orbit: {
         minZoom: 0.6,
@@ -184,48 +201,48 @@ export const projects: Project[] = [
     model: "/projects/oldman-monster/oldman-monster-scene.glb?v=1",
     viewer: {
       toneMapping: "agx",
-      exposureEV: -0.9,
-      backgroundHex: 0x02010a,
+      exposureEV: -0.4,
+      backgroundHex: 0x060a18,
       environmentIntensity: 0,
       camera: {
-        // Pulled up and around from the exact Blender camera so the opening
-        // shot frames both figures from a 3/4 angle instead of staring straight
-        // down the torch beam (which floods the fog to white).
+        // The scene camera exactly as exported in the GLB (its glTF transform,
+        // expressed back in Blender space for the shared conversion below), so the
+        // opening shot is the framing the render was composed on: a low, near
+        // eye-level 3/4 with both figures in frame.
         type: "perspective",
-        position: [11.5, -9.0, 6.5],
-        target: [-0.5, 0, 2.4],
-        fovVerticalDeg: 30,
+        position: [8.493312, -10.480357, 3.236283],
+        target: [-0.718, 0.052, 2.051],
+        fovVerticalDeg: 25.36,
       },
       lights: [
         {
           // Torch / flashlight beam the old man holds — warm orange.
           kind: "spot",
           position: [0.411056, -1.624895, 0.544829],
-          target: [0.355, 2.0, 1.1],
+          // Aim taken from the light's own GLB rotation, not eyeballed.
+          target: [0.189, 2.212, 1.654],
           colorHex: 0xff4a08,
-          intensity: 14,
+          intensity: 22,
           angleDeg: 53.6,
           penumbra: 0.68,
           distance: 14,
-          decay: 1.8,
+          decay: 2,
           castShadow: true,
-          // Not fed to the volumetric pass: the torch points back toward the
-          // viewer, so scattering it into the fog floods the frame. It still
-          // lights the scene as a normal spot; the two street lamps (which
-          // shine downward) carry the visible god-ray beams.
-          volumetric: false,
+          // Visible in the render as a warm cone thrown forward across the road
+          // into the monster's legs, so it feeds the volumetric pass too.
+          volumetric: true,
         },
         {
           // Street lamp — near old man.
           kind: "spot",
           position: [-2.657892, -1.821705, 4.504978],
-          target: [-2.42, -1.79, 0],
+          target: [-1.692, -1.809, 0.623],
           colorHex: 0xffa040,
-          intensity: 26,
+          intensity: 220,
           angleDeg: 53.6,
           penumbra: 0.68,
           distance: 16,
-          decay: 1.4,
+          decay: 2,
           castShadow: true,
           volumetric: true,
         },
@@ -233,13 +250,13 @@ export const projects: Project[] = [
           // Street lamp — near monster.
           kind: "spot",
           position: [-2.657892, 3.14037, 4.513879],
-          target: [-2.59, 3.15, 0],
+          target: [-2.378, 3.153, 0.524],
           colorHex: 0xffa040,
-          intensity: 26,
+          intensity: 220,
           angleDeg: 53.6,
           penumbra: 0.68,
           distance: 16,
-          decay: 1.4,
+          decay: 2,
           castShadow: true,
           volumetric: true,
         },
@@ -248,8 +265,8 @@ export const projects: Project[] = [
           kind: "rect",
           position: [-0.472864, 4.925318, 4.913879],
           target: [-0.47, 0, 0],
-          colorHex: 0x0a2bff,
-          intensity: 24,
+          colorHex: 0x3358d8,
+          intensity: 18,
           width: 6,
           height: 6,
         },
@@ -258,16 +275,17 @@ export const projects: Project[] = [
         sourceMeshName: "Fog",
         boundsMin: [-4.67, -5.25, -0.5],
         boundsMax: [2.98, 5.25, 6.5],
-        density: 0.028,
+        density: 0.15,
         anisotropy: 0.68,
         colorHex: 0x223049,
         steps: 56,
-        strength: 0.22,
+        strength: 260,
+        ambient: 0.22,
       },
-      emissiveClamp: 1.5,
+      emissiveClamp: 2.0,
       // Just enough bloom to make the red eyes and lamp filaments glow, with a
       // high threshold so the haze and lit surfaces never smear to white.
-      bloom: { strength: 0.0, radius: 0.4, threshold: 1.35 },
+      bloom: { strength: 0.5, radius: 0.4, threshold: 0.85 },
       orbit: {
         minDistance: 6,
         maxDistance: 24,

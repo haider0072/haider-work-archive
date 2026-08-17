@@ -50,6 +50,85 @@ type ViewerHandle = {
   onError: () => void;
 };
 
+/** Edge length of the square used to sample a frame for the health probe below. */
+const COMPOSER_PROBE_SIZE = 32;
+/** How many frames the probe may stay inconclusive before it gives up. */
+const COMPOSER_PROBE_ATTEMPTS = 30;
+
+/**
+ * Number of sampled pixels that differ from the first one. Zero means the region
+ * is a single flat colour — nothing was drawn into it. Null means the region could
+ * not be sampled at all, which is not evidence either way.
+ */
+function frameVariation(
+  renderer: WebGLRenderer,
+  target: import("three").WebGLRenderTarget,
+): number | null {
+  const w = Math.min(target.width, COMPOSER_PROBE_SIZE);
+  const h = Math.min(target.height, COMPOSER_PROBE_SIZE);
+  if (w < 2 || h < 2) return null;
+  const x = Math.max(0, Math.floor((target.width - w) / 2));
+  const y = Math.max(0, Math.floor((target.height - h) / 2));
+  const pixels = new Uint16Array(w * h * 4); // half-float buffers
+  try {
+    renderer.readRenderTargetPixels(target, x, y, w, h, pixels);
+  } catch {
+    return null; // readback unsupported here — no verdict rather than a guess
+  }
+  let distinct = 0;
+  for (let i = 4; i < pixels.length; i += 4) {
+    if (
+      pixels[i] !== pixels[0] ||
+      pixels[i + 1] !== pixels[1] ||
+      pixels[i + 2] !== pixels[2]
+    ) {
+      distinct++;
+    }
+  }
+  return distinct;
+}
+
+/**
+ * True if the post-processing chain rendered something, false if it produced a flat
+ * frame while a direct render of the same scene did not, null if inconclusive.
+ */
+function composerProducedAnImage(
+  THREE: typeof import("three"),
+  renderer: WebGLRenderer,
+  composer: import("three/examples/jsm/postprocessing/EffectComposer.js").EffectComposer,
+  scene: import("three").Scene,
+  camera: OrthographicCamera | PerspectiveCamera,
+  syncPassUniforms: () => void,
+): boolean | null {
+  const scratch = new THREE.WebGLRenderTarget(
+    COMPOSER_PROBE_SIZE,
+    COMPOSER_PROBE_SIZE,
+    { type: THREE.HalfFloatType },
+  );
+  try {
+    const previousTarget = renderer.getRenderTarget();
+    renderer.setRenderTarget(scratch);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(previousTarget);
+
+    const direct = frameVariation(renderer, scratch);
+    // Nothing on screen yet, or no readback — there is nothing to compare against.
+    if (direct === null || direct === 0) return null;
+
+    const wasRenderingToScreen = composer.renderToScreen;
+    composer.renderToScreen = false;
+    syncPassUniforms();
+    composer.render();
+    composer.renderToScreen = wasRenderingToScreen;
+
+    const composed = frameVariation(renderer, composer.readBuffer);
+    if (composed === null) return null;
+    return composed > 0;
+  } finally {
+    scratch.dispose();
+  }
+}
+
 async function mountViewer(
   host: HTMLDivElement,
   handle: ViewerHandle,
@@ -59,7 +138,7 @@ async function mountViewer(
   const [
     THREE,
     { GLTFLoader },
-    { RGBELoader },
+    { HDRLoader },
     { OrbitControls },
     { RectAreaLightUniformsLib },
     { EffectComposer },
@@ -70,7 +149,7 @@ async function mountViewer(
   ] = await Promise.all([
     import("three"),
     import("three/examples/jsm/loaders/GLTFLoader.js"),
-    import("three/examples/jsm/loaders/RGBELoader.js"),
+    import("three/examples/jsm/loaders/HDRLoader.js"),
     import("three/examples/jsm/controls/OrbitControls.js"),
     import("three/examples/jsm/lights/RectAreaLightUniformsLib.js"),
     import("three/examples/jsm/postprocessing/EffectComposer.js"),
@@ -114,7 +193,10 @@ async function mountViewer(
   renderer.toneMapping = toneMap[config.toneMapping] ?? THREE.AgXToneMapping;
   renderer.toneMappingExposure = Math.pow(2, config.exposureEV);
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.VSMShadowMap;
+  // PCF over VSM: VSM's light bleeding washed the diorama's contact shadow out
+  // entirely against a strong image-based environment. (PCFSoftShadowMap is
+  // deprecated in this version of three and silently downgrades to this anyway.)
+  renderer.shadowMap.type = THREE.PCFShadowMap;
   host.replaceChildren(renderer.domElement);
 
   // -- Scene ----------------------------------------------------------------
@@ -251,7 +333,7 @@ async function mountViewer(
 
     const pmrem = new THREE.PMREMGenerator(renderer);
     pmrem.compileEquirectangularShader();
-    new RGBELoader().load(
+    new HDRLoader().load(
       config.environmentHdr,
       (texture) => {
         if (isDisposed()) {
@@ -313,6 +395,18 @@ async function mountViewer(
     (gltf) => {
       if (isDisposed()) return;
       modelRoot = gltf.scene;
+
+      // Blender ships its own lights inside the GLB via KHR_lights_punctual, and the
+      // exporter converts watts to candela — a 1000 W lamp arrives as intensity 54351,
+      // which floods the frame. `config.lights` already reconstructs this rig with
+      // values tuned for three's falloff, so drop the imported copies instead of
+      // letting the two rigs stack.
+      const importedLights: Object3D[] = [];
+      modelRoot.traverse((object) => {
+        if ((object as { isLight?: boolean }).isLight) importedLights.push(object);
+      });
+      for (const light of importedLights) light.parent?.remove(light);
+
       modelRoot.traverse((object) => {
         if (!(object instanceof THREE.Mesh)) return;
         object.castShadow = true;
@@ -361,26 +455,35 @@ async function mountViewer(
     !isOrtho && (!!config.volumetric || !!config.bloom) && !!config.bloom;
 
   let composer: import("three/examples/jsm/postprocessing/EffectComposer.js").EffectComposer | null = null;
-  let depthTexture: import("three").DepthTexture | null = null;
   let fogPass: import("three/examples/jsm/postprocessing/ShaderPass.js").ShaderPass | null = null;
   let bloomPass: import("three/examples/jsm/postprocessing/UnrealBloomPass.js").UnrealBloomPass | null = null;
 
   if (wantsComposer) {
-    depthTexture = new THREE.DepthTexture(drawSize.x, drawSize.y);
-    depthTexture.type = THREE.UnsignedIntType;
-    depthTexture.format = THREE.DepthFormat;
+    // Each of the composer's two ping-pong buffers needs its OWN depth attachment.
+    // The fog pass samples the depth of the buffer it reads while writing into the
+    // other one; if both buffers shared a single DepthTexture, that texture would be
+    // a bound depth attachment and a sampled texture in the same draw call — a GL
+    // feedback loop, which renders nothing at all and reports no error.
+    // EffectComposer clones the render target it is given, and RenderTarget.clone()
+    // clones the depth texture with it, so passing one here yields two independent
+    // attachments; nothing further should reassign them.
+    const sceneDepth = new THREE.DepthTexture(drawSize.x, drawSize.y);
+    sceneDepth.type = THREE.UnsignedIntType;
+    sceneDepth.format = THREE.DepthFormat;
 
     const rt = new THREE.WebGLRenderTarget(drawSize.x, drawSize.y, {
-      depthTexture,
+      depthTexture: sceneDepth,
       depthBuffer: true,
       type: THREE.HalfFloatType,
       samples: 0,
     });
 
     composer = new EffectComposer(renderer, rt);
-    // RenderPass renders into readBuffer (renderTarget2), whose depth texture is
-    // a clone; force it to share our instance so the fog pass reads live depth.
-    composer.renderTarget2.depthTexture = depthTexture;
+    // Size the composer in CSS pixels: setSize() applies the renderer's pixel ratio
+    // itself, and addPass() derives each pass's size the same way. Constructing it
+    // from a device-pixel target leaves _width in device pixels, which would then
+    // allocate every pass at pixelRatio^2.
+    composer.setSize(width, height);
 
     composer.addPass(new RenderPass(scene, camera));
 
@@ -388,7 +491,6 @@ async function mountViewer(
       fogPass = new ShaderPass(
         buildVolumetricShader(THREE, config, volumetricSpots.length || 1),
       );
-      fogPass.uniforms.tDepth.value = depthTexture;
       composer.addPass(fogPass);
     }
 
@@ -410,7 +512,12 @@ async function mountViewer(
   const tmpCamPos = new THREE.Vector3();
 
   function updateFogUniforms() {
-    if (!fogPass || !config.volumetric) return;
+    if (!fogPass || !config.volumetric || !composer) return;
+    // RenderPass draws into the composer's current read buffer, so that buffer's
+    // depth attachment holds this frame's depth. The two buffers swap once per
+    // enabled swapping pass, so which one that is has to be re-read every frame
+    // rather than bound once at setup.
+    fogPass.uniforms.tDepth.value = composer.readBuffer.depthTexture;
     camera.updateMatrixWorld();
     tmpInvVP
       .multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse)
@@ -445,10 +552,11 @@ async function mountViewer(
     }
     renderer.setSize(w, h, false);
     if (composer) {
+      // CSS pixels — setSize() applies the pixel ratio to the buffers and to every
+      // pass. Both depth textures are resized by three when their render target's
+      // framebuffer is rebuilt.
+      composer.setSize(w, h);
       const ds = renderer.getDrawingBufferSize(new THREE.Vector2());
-      composer.setSize(ds.x, ds.y);
-      if (depthTexture) composer.renderTarget2.depthTexture = depthTexture;
-      bloomPass?.setSize(ds.x, ds.y);
       if (fogPass) fogPass.uniforms.uResolution.value.set(ds.x, ds.y);
     }
   };
@@ -456,14 +564,61 @@ async function mountViewer(
   resizeObserver.observe(host);
 
   // -- Render loop ----------------------------------------------------------
+  // A post-processing chain that fails at the GL level — an incomplete framebuffer,
+  // a texture bound for sampling and as an attachment in the same draw, a driver that
+  // rejects a pass — neither throws nor logs. It just yields an empty frame, which
+  // reads to the user as a broken viewer. Compare one composed frame against a direct
+  // render of the same scene and drop the chain if it produced nothing. Inconclusive
+  // attempts (nothing drawn yet, no readback support) retry for a bounded number of
+  // frames and then leave the chain alone.
+  let probesRemaining = COMPOSER_PROBE_ATTEMPTS;
+
   let frame = 0;
   const renderLoop = () => {
     if (isDisposed()) return;
     controls.update();
+
+    if (composer && probesRemaining > 0 && modelRoot) {
+      probesRemaining--;
+      let healthy: boolean | null = null;
+      try {
+        healthy = composerProducedAnImage(
+          THREE,
+          renderer,
+          composer,
+          scene,
+          camera,
+          updateFogUniforms,
+        );
+      } catch (error) {
+        console.warn("[model-viewer] post-processing probe failed", error);
+        healthy = false;
+      }
+      if (healthy === false) {
+        console.warn(
+          "[model-viewer] post-processing produced an empty frame; falling back to direct rendering",
+        );
+        composer.dispose();
+        composer = null;
+      } else if (healthy === true) {
+        probesRemaining = 0;
+      }
+    }
+
     if (composer) {
       updateFogUniforms();
       // (Jitter is static per-pixel now, so no per-frame counter is needed.)
-      composer.render();
+      try {
+        composer.render();
+      } catch (error) {
+        console.warn(
+          "[model-viewer] post-processing threw; falling back to direct rendering",
+          error,
+        );
+        composer.dispose();
+        composer = null;
+        renderer.render(scene, camera);
+      }
     } else {
       renderer.render(scene, camera);
     }
@@ -478,7 +633,8 @@ async function mountViewer(
     controls.dispose();
     environmentTexture?.dispose();
     pmremRT?.dispose();
-    depthTexture?.dispose();
+    composer?.renderTarget1.depthTexture?.dispose();
+    composer?.renderTarget2.depthTexture?.dispose();
     fogPass?.dispose?.();
     bloomPass?.dispose?.();
     composer?.dispose?.();
@@ -545,10 +701,11 @@ function buildVolumetricShader(
       uSigmaT: { value: vol.density },
       uG: { value: vol.anisotropy },
       uStrength: { value: vol.strength ?? 1.0 },
+      uAmbient: { value: vol.ambient ?? 0.05 },
       uAmbientHaze: {
-        // Very faint blue floor so shadowed haze isn't pure black; kept low so
-        // the deep night contrast of the render survives.
-        value: new THREE.Color(vol.colorHex).multiplyScalar(0.006),
+        // Faint blue floor so shadowed haze isn't pure black; scaled by uAmbient
+        // independently of the beam gain so the deep night contrast survives.
+        value: new THREE.Color(vol.colorHex),
       },
       uSpotPos: {
         value: Array.from({ length: nSpot }, () => new THREE.Vector3()),
@@ -557,14 +714,14 @@ function buildVolumetricShader(
         value: Array.from({ length: nSpot }, () => new THREE.Vector3(0, -1, 0)),
       },
       uSpotColor: {
-        // Beam colour only — brightness is governed physically by the
-        // scattering integral (uSigmaT * dt per step) and uStrength, so the
-        // per-light multiplier stays modest to avoid a blown-out frame.
+        // Beam colour, weighted by the light's own intensity so a dim torch and a
+        // bright street lamp keep their relative strength in the haze. Absolute
+        // brightness is governed by the scattering integral and uStrength.
         value: config.lights
           .filter((l) => l.kind === "spot" && l.volumetric)
           .map((l) =>
             new THREE.Color((l as { colorHex: number }).colorHex).multiplyScalar(
-              Math.min(((l as { intensity: number }).intensity ?? 1) / 60, 1.2),
+              Math.min(((l as { intensity: number }).intensity ?? 1) / 120, 2.0),
             ),
           ),
       },
@@ -615,6 +772,7 @@ function buildVolumetricShader(
       uniform float uSigmaT;
       uniform float uG;
       uniform float uStrength;
+      uniform float uAmbient;
       uniform vec3  uAmbientHaze;
       uniform vec3  uBoxMin;
       uniform vec3  uBoxMax;
@@ -702,7 +860,12 @@ function buildVolumetricShader(
         float jitter = hash12(gl_FragCoord.xy);
         float t = tStart + jitter * dt;
 
-        vec3 scatter = vec3(0.0);
+        // Beam and ambient in-scatter accumulate separately. A single 1/d^2 spot
+        // sample carries far less energy than the uniform haze term, so one shared
+        // gain cannot serve both: the multiplier that makes the god-ray cones read
+        // also floods the whole fog box to a flat milky grey.
+        vec3 beam = vec3(0.0);
+        vec3 ambient = vec3(0.0);
         float transmittance = 1.0;
 
         for (int s = 0; s < MAX_STEPS; ++s) {
@@ -710,7 +873,7 @@ function buildVolumetricShader(
           vec3 p = uCamPos + rayDir * t;
           float stepT = exp(-uSigmaT * dt);
 
-          vec3 inScat = uAmbientHaze;
+          vec3 inScat = vec3(0.0);
           for (int i = 0; i < NSPOT; ++i) {
             inScat += spotInScatter(i, p, rayDir);
           }
@@ -718,15 +881,18 @@ function buildVolumetricShader(
           // Scattering is proportional to the medium density over the step
           // (uSigmaT * dt), so total in-scatter stays bounded regardless of how
           // many steps subdivide the beam — otherwise it blows out.
-          scatter += transmittance * inScat * uSigmaT * dt;
+          float density = transmittance * uSigmaT * dt;
+          beam += inScat * density;
+          ambient += uAmbientHaze * density;
           transmittance *= stepT;
           t += dt;
           if (transmittance < 0.01) break;
         }
 
-        // Clamp total in-scatter so the brightest beam cores stay in a filmic
-        // range (AgX still rolls them off) instead of flaring to pure white.
-        scatter = min(scatter * uStrength, vec3(0.42));
+        // Bound the integral so a ray grazing a lamp cannot spike to a huge value,
+        // but leave enough headroom for the beam cores to reach the near-white the
+        // render has — the tone mapper does the roll-off from here.
+        vec3 scatter = min(beam * uStrength + ambient * uAmbient, vec3(1.2));
         vec3 outColor = sceneColor + scatter;
         gl_FragColor = vec4(outColor, 1.0);
       }
@@ -783,6 +949,18 @@ function createLight(
   if (light.castShadow) {
     dir.castShadow = true;
     dir.shadow.mapSize.set(2048, 2048);
+    // The default +/-5 ortho frustum clips a diorama this size, dropping the cast
+    // shadow off the backdrop entirely.
+    const shadowCamera = dir.shadow.camera;
+    shadowCamera.left = -9;
+    shadowCamera.right = 9;
+    shadowCamera.top = 9;
+    shadowCamera.bottom = -9;
+    shadowCamera.near = 0.5;
+    shadowCamera.far = 40;
+    shadowCamera.updateProjectionMatrix();
+    dir.shadow.bias = -0.0008;
+    dir.shadow.normalBias = 0.02;
   }
   return [dir, target];
 }
